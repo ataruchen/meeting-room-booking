@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>會議室租借系統 | 公司內部預約</title>
+<meta name="description" content="取代 Outlook 會議室租借的純前端網頁：不需 Exchange Server，可放在 Linux 主機上，多人同時預約、即時防重複預約。">
+<!--
+  ============================================================
+  會議室租借系統（單一檔案版）
+  用法：
+  1. 直接用瀏覽器開啟本檔案即可使用，不需後端、不需 Exchange。
+  2. 放在公司 Linux 主機也很簡單，例如：
+       sudo cp index.html /var/www/html/
+     再用 Nginx / Apache 對外提供，或本機測試：
+       python3 -m http.server 8000
+  3. 多人「跨裝置」即時同步（選用）：
+     - 到 Firebase Console 建立專案，啟用 Realtime Database
+     - 把下方 FIREBASE_CONFIG 的 null 換成你的 firebaseConfig
+     - Database Rules 建議（僅供內部使用時再依公司政策收緊）：
+       { "rules": { "meeting-bookings": { ".read": true, ".write": true } } }
+     - 未填設定時，自動使用本機模式：同一瀏覽器多分頁
+       會透過 BroadcastChannel + storage 事件即時同步。
+  注意：本頁示範資料只在第一次開啟時建立，可按「清除示範資料」刪掉。
+  ============================================================
+-->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#2563eb; --accent-soft:#eff6ff; --ok:#059669; --ok-soft:#ecfdf5;
+    --warn:#d97706; --danger:#dc2626; --radius:16px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6}
+  a{color:var(--accent)}
+  header{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+  .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;flex-wrap:wrap}
+  .logo{font-size:22px;font-weight:800;letter-spacing:.02em}
+  .logo span{color:var(--accent)}
+  .subtitle{color:var(--muted);font-size:14px;margin-top:2px}
+  .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;border-radius:999px;padding:6px 12px;font-size:13px;white-space:nowrap}
+  .dot{width:8px;height:8px;border-radius:50%;background:#f59e0b}
+  .dot.on{background:var(--ok)}
+  main{padding:24px 0 48px}
+  h1{font-size:28px;margin:0 0 6px}
+  h2{font-size:19px;margin:0 0 12px}
+  h3{font-size:16px;margin:0 0 4px}
+  p.lead{color:var(--muted);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
+  .controls{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:16px}
+  .field{flex:1;min-width:160px}
+  .field label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+  .field input,.field select,.field textarea{width:100%;padding:11px 12px;border:1px solid #d1d5db;border-radius:10px;font-size:15px;background:#fff;color:var(--text)}
+  .field textarea{resize:vertical;min-height:72px}
+  .btn{border:0;border-radius:10px;padding:11px 18px;font-size:15px;cursor:pointer;font-weight:700}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-ghost{background:#fff;border:1px solid var(--line);color:var(--text)}
+  .btn-danger{background:#fef2f2;color:var(--danger);border:1px solid #fecaca}
+  .btn-small{padding:7px 12px;font-size:13px;border-radius:8px}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .date-nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .date-nav strong{font-size:17px;min-width:150px;text-align:center}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+  .stat b{font-size:24px;display:block;line-height:1.2}
+  .stat span{color:var(--muted);font-size:13px}
+  .rooms{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px}
+  .room{position:relative}
+  .room .meta{color:var(--muted);font-size:13px;margin:6px 0 12px}
+  .tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  .tag{background:#f3f4f6;border:1px solid var(--line);border-radius:999px;padding:3px 9px;font-size:12px}
+  .room-foot{display:flex;gap:8px;flex-wrap:wrap}
+  .avail{font-size:13px;font-weight:700}
+  .avail.free{color:var(--ok)} .avail.busy{color:var(--warn)}
+  .day-bookings{margin-top:14px;border-top:1px dashed var(--line);padding-top:12px}
+  .booking-chip{display:flex;justify-content:space-between;gap:10px;background:var(--accent-soft);border-radius:10px;padding:9px 11px;margin-bottom:8px;font-size:13px}
+  .booking-chip b{font-size:13px}
+  .booking-chip small{color:var(--muted);display:block}
+  .empty{color:var(--muted);font-size:14px}
+  .toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin:28px 0 12px}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .seg button{border:0;background:transparent;padding:9px 14px;cursor:pointer;font-size:14px}
+  .seg button.active{background:var(--text);color:#fff}
+  .table-wrap{overflow-x:auto;background:#fff;border:1px solid var(--line);border-radius:var(--radius)}
+  table{border-collapse:collapse;width:100%;min-width:760px;font-size:13px}
+  th,td{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;vertical-align:top}
+  th{background:#f9fafb;white-space:nowrap}
+  td.time{white-space:nowrap;color:var(--muted);width:82px}
+  td.slot{cursor:pointer;min-width:130px}
+  td.slot:hover{background:var(--accent-soft)}
+  td.slot.booked{background:#fef3c7;cursor:default}
+  td.slot.booked:hover{background:#fef3c7}
+  td.slot b{display:block;font-size:13px}
+  td.slot small{color:var(--muted)}
+  .list-item{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding:14px 0}
+  .list-item:last-child{border-bottom:0}
+  .my-filter{margin-top:14px}
+  /* Modal */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-start;justify-content:center;padding:24px 16px;z-index:50;overflow:auto}
+  .overlay.open{display:flex}
+  .modal{background:#fff;border-radius:18px;max-width:560px;width:100%;padding:24px}
+  .modal-head{display:flex;justify-content:space-between;align-items:start;gap:12px}
+  .close{border:0;background:#f3f4f6;border-radius:50%;width:34px;height:34px;cursor:pointer;font-size:18px;line-height:1}
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+  .full{grid-column:1/-1}
+  .error{display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:10px;padding:10px 12px;font-size:14px;margin-top:12px}
+  .error.show{display:block}
+  .success{display:none;background:var(--ok-soft);border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:14px;margin-top:12px}
+  .success.show{display:block}
+  details{margin-top:24px}
+  details summary{cursor:pointer;font-weight:700}
+  code{background:#f3f4f6;padding:2px 6px;border-radius:6px;font-size:13px}
+  footer{color:var(--muted);font-size:13px;text-align:center;padding:0 0 32px}
+  @media (max-width:900px){
+    .rooms{grid-template-columns:repeat(2,1fr)}
+    .stats{grid-template-columns:repeat(2,1fr)}
+    h1{font-size:24px}
+  }
+  @media (max-width:600px){
+    .wrap{padding:0 14px}
+    .rooms{grid-template-columns:1fr}
+    .form-grid{grid-template-columns:1fr}
+    .topbar{padding:12px 0}
+    .logo{font-size:20px}
+    .date-nav strong{min-width:0}
+    .controls .field{min-width:140px}
+    .list-item{flex-direction:column}
+    .modal{padding:18px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap topbar">
+    <div>
+      <div class="logo">會議室<span>租借</span></div>
+      <div class="subtitle">不需 Exchange / Outlook，Linux 主機直接可用</div>
+    </div>
+    <span class="badge"><span class="dot" id="syncDot"></span><span id="syncText">本機模式</span></span>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>今天要開哪一間會？</h1>
+  <p class="lead">選日期、看空閒時段、點一下就預約。同一時段同一間會議室只能有一筆預約，系統會自動擋下重複預約，並即時同步給其他正在看這個頁面的人。</p>
+
+  <section class="card">
+    <div class="controls">
+      <div class="field" style="flex:0 0 auto;min-width:260px">
+        <label>預約日期</label>
+        <div class="date-nav">
+          <button class="btn btn-ghost btn-small" id="prevDay" type="button">← 前一天</button>
+          <strong id="dateLabel">—</strong>
+          <button class="btn btn-ghost btn-small" id="nextDay" type="button">後一天 →</button>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          <input type="date" id="dateInput" aria-label="選擇日期">
+          <button class="btn btn-ghost btn-small" id="todayBtn" type="button">回到今天</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="capacityFilter">需要容納人數</label>
+        <select id="capacityFilter">
+          <option value="0">不限</option>
+          <option value="4">4 人以上</option>
+          <option value="6">6 人以上</option>
+          <option value="10">10 人以上</option>
+          <option value="20">20 人</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="searchInput">搜尋會議 / 預約人</label>
+        <input type="search" id="searchInput" placeholder="例如：週會、陳小明">
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="statRooms">—</b><span>會議室總數</span></div>
+      <div class="stat"><b id="statToday">—</b><span>所選日期預約數</span></div>
+      <div class="stat"><b id="statFreeNow">—</b><span>現在空閒的會議室</span></div>
+      <div class="stat"><b id="statFreeToday">—</b><span>所選日期尚有空檔的會議室</span></div>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="newBookingBtn" type="button">＋ 新增預約</button>
+      <button class="btn btn-ghost" id="clearDemoBtn" type="button">清除示範資料</button>
+    </div>
+    <div class="success" id="globalMsg"></div>
+  </section>
+
+  <div class="toolbar">
+    <h2 style="margin:0">會議室一覽</h2>
+    <span class="empty">點「預約」或點時間表上的空閒格子都可以預約</span>
+  </div>
+  <section class="rooms" id="roomsGrid"></section>
+
+  <div class="toolbar">
+    <h2 style="margin:0" id="scheduleTitle">全日時間表</h2>
+    <div class="seg" role="tablist" aria-label="檢視切換">
+      <button type="button" id="viewTableBtn" class="active">時間表</button>
+      <button type="button" id="viewListBtn">清單</button>
+    </div>
+  </div>
+
+  <section id="tableView" class="table-wrap">
+    <table aria-label="會議室全日時間表">
+      <thead><tr id="tableHead"></tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </section>
+
+  <section id="listView" class="card" style="display:none">
+    <div id="listBody"></div>
+    <div class="my-filter">
+      <label for="myNameInput" style="font-size:13px;color:var(--muted)">只看我的預約：輸入預約人姓名</label>
+      <input type="text" id="myNameInput" placeholder="例如：陳小明" style="width:100%;padding:11px 12px;border:1px solid #d1d5db;border-radius:10px;font-size:15px;margin-top:6px">
+    </div>
+  </section>
+
+  <details class="card">
+    <summary>給 IT / 管理者：如何讓全公司跨裝置同步（約 5 分鐘，一次性）</summary>
+    <p>這個頁面本身不需要後端。如果只在同一台電腦或同一個瀏覽器使用，現在就能多人分頁同步。如果要讓不同電腦、不同部門即時看到同一份預約表，請用 Firebase Realtime Database：</p>
+    <ol>
+      <li>到 Firebase Console 建立專案，啟用 Realtime Database（地區選 asia-southeast1 較近）。</li>
+      <li>建立 Web App，把取得的 <code>firebaseConfig</code> 貼到本檔案最下方 <code>FIREBASE_CONFIG</code>，取代 <code>null</code>。</li>
+      <li>依公司政策設定 Rules，內部測試可用 <code>meeting-bookings</code> 讀寫開放，正式上線建議再收緊。</li>
+      <li>把這個檔案放到 Linux 主機（Nginx / Apache 的網站目錄）即可，全公司用同一個網址開啟。</li>
+    </ol>
+    <p style="color:var(--muted)">未填設定時，頁面會顯示「本機模式」，資料只存在這台裝置的瀏覽器，不會上傳到任何伺服器。</p>
+  </details>
+</main>
+
+<footer>純前端單一檔案 ・ 可直接部署於 Linux 主機 ・ 不依賴 Exchange Server 或 Outlook</footer>
+
+<div class="overlay" id="overlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="modalTitle" style="margin:0">新增預約</h2>
+        <p class="empty" style="margin:4px 0 0">同一間會議室、同一時段重疊會被擋下，請改選其他時段。</p>
+      </div>
+      <button class="close" id="closeModal" type="button" aria-label="關閉">×</button>
+    </div>
+    <form id="bookingForm">
+      <div class="form-grid">
+        <div class="field full">
+          <label for="fRoom">會議室 *</label>
+          <select id="fRoom" required></select>
+        </div>
+        <div class="field">
+          <label for="fDate">日期 *</label>
+          <input type="date" id="fDate" required>
+        </div>
+        <div class="field">
+          <label for="fTitle">會議名稱 *</label>
+          <input type="text" id="fTitle" placeholder="例如：產品週會" required maxlength="60">
+        </div>
+        <div class="field">
+          <label for="fStart">開始時間 *</label>
+          <select id="fStart" required></select>
+        </div>
+        <div class="field">
+          <label for="fEnd">結束時間 *</label>
+          <select id="fEnd" required></select>
+        </div>
+        <div class="field">
+          <label for="fName">預約人 *</label>
+          <input type="text" id="fName" placeholder="你的姓名" required maxlength="30">
+        </div>
+        <div class="field full">
+          <label for="fNote">備註（議程、設備需求等）</label>
+          <textarea id="fNote" placeholder="例如：需要視訊會議、準備白板筆"></textarea>
+        </div>
+      </div>
+      <div class="error" id="formError"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap">
+        <button class="btn btn-ghost" type="button" id="cancelForm">取消</button>
+        <button class="btn btn-primary" type="submit">確認預約</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+  // ===== 設定：多人跨裝置同步用。未設定 = 本機模式 =====
+  const FIREBASE_CONFIG = null;
+  // 範例（填入後即啟用，請勿把正式金鑰貼到公開場合）：
+  // const FIREBASE_CONFIG = { apiKey:"...", authDomain:"...", databaseURL:"...", projectId:"...", appId:"..." };
+
+  const ROOMS = [
+    { id:"NK2-101", name:"南科二廠101會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-102", name:"南科二廠102會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-201", name:"南科二廠201會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-202", name:"南科二廠202會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-301", name:"南科二廠301會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-302", name:"南科二廠302會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-501", name:"南科二廠501會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-502", name:"南科二廠502會議室", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK2-5F", name:"南科二廠5F活動中心", capacity:null, floor:"南科二廠", equip:[], desc:"" },
+    { id:"NK5-1F", name:"南科五廠1F國際會議廳", capacity:null, floor:"南科五廠", equip:[], desc:"" },
+    { id:"NK5-202", name:"南科五廠202會議室", capacity:null, floor:"南科五廠", equip:[], desc:"" },
+    { id:"NK5-302", name:"南科五廠302會議室", capacity:null, floor:"南科五廠", equip:[], desc:"" },
+  ];
+  // 注意：圖片中只提供會議室名稱，未提供容納人數與其他設備，
+  // 因此 capacity 設為 null（顯示「容納人數待確認」），未標示的設備不憑空補上。
+  // 之後拿到人數資料時，只要把對應的 capacity 填上數字即可。
+  const OPEN_MIN = 8*60, CLOSE_MIN = 20*60;
+  const LS_KEY = "meeting-room-bookings-v2";
+  const $ = id => document.getElementById(id);
+
+  function fmtDate(d){ const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,"0"), day=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${day}`; }
+  function parseDate(s){ const [y,m,d]=s.split("-").map(Number); return new Date(y,m-1,d); }
+  function addDays(s,n){ const d=parseDate(s); d.setDate(d.getDate()+n); return fmtDate(d); }
+  function toMin(t){ const [h,m]=t.split(":").map(Number); return h*60+m; }
+  function toTime(min){ return `${String(Math.floor(min/60)).padStart(2,"0")}:${String(min%60).padStart(2,"0")}`; }
+  function overlaps(aStart,aEnd,bStart,bEnd){ return toMin(aStart) < toMin(bEnd) && toMin(bStart) < toMin(aEnd); }
+  function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+  function weekdayLabel(s){
+    const w=["週日","週一","週二","週三","週四","週五","週六"][parseDate(s).getDay()];
+    return `${s}（${w}）`;
+  }
+
+  let selectedDate = fmtDate(new Date());
+  let bookings = [];
+  let viewMode = "table";
+  let firebaseRef = null, syncingFromRemote = false;
+  let channel = null;
+  try { channel = new BroadcastChannel("meeting-room-booking"); channel.onmessage = e => { if(e.data?.type==="bookings"){ bookings=stripRemovedFields(e.data.bookings); renderAll(); } }; } catch(e){}
+
+  function seedDemo(){
+    const today = fmtDate(new Date()), tomorrow = addDays(today,1);
+    return [
+      { id:"demo1", roomId:"NK2-101", date:today, start:"09:00", end:"10:00", title:"產品週會", name:"陳小明", note:"本週進度與風險", createdAt:Date.now() },
+      { id:"demo2", roomId:"NK2-301", date:today, start:"14:00", end:"15:00", title:"跨廠會議", name:"林小華", note:"", createdAt:Date.now() },
+      { id:"demo3", roomId:"NK5-1F", date:tomorrow, start:"10:30", end:"11:30", title:"客戶簡報彩排", name:"王大明", note:"", createdAt:Date.now() },
+    ];
+  }
+  // 2026-10-28 起預約不再有部門與預計人數：舊資料讀入時把這兩個欄位去掉，
+  // 預約本身（會議室、日期、時段、名稱、預約人、備註）不受影響。
+  function stripRemovedFields(list){
+    return (Array.isArray(list) ? list : []).map(b => { const { dept, count, ...rest } = b; return rest; });
+  }
+  function loadLocal(){
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if(raw){ bookings = stripRemovedFields(JSON.parse(raw)); saveLocal(); return; }
+    } catch(e){}
+    bookings = seedDemo(); saveLocal();
+  }
+  function saveLocal(){
+    try { localStorage.setItem(LS_KEY, JSON.stringify(bookings)); } catch(e){}
+    try { channel?.postMessage({ type:"bookings", bookings }); } catch(e){}
+  }
+  function saveAll(){
+    if(firebaseRef && !syncingFromRemote){
+      firebaseRef.set(bookings).catch(()=>{ saveLocal(); });
+    } else {
+      saveLocal();
+    }
+  }
+  function initFirebase(){
+    if(!FIREBASE_CONFIG || typeof firebase === "undefined") return false;
+    try {
+      if(!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+      firebaseRef = firebase.database().ref("meeting-bookings");
+      firebaseRef.on("value", snap => {
+        const val = snap.val();
+        if(Array.isArray(val)){
+          syncingFromRemote = true; bookings = stripRemovedFields(val); saveLocal(); syncingFromRemote = false; renderAll();
+        }
+      });
+      $("syncDot").classList.add("on"); $("syncText").textContent = "多人同步已開啟";
+      return true;
+    } catch(e){ return false; }
+  }
+
+  // ===== 篩選 =====
+  function filteredRooms(){
+    const cap = Number($("capacityFilter").value || 0);
+    const equip = $("equipFilter") ? $("equipFilter").value : "";
+    return ROOMS.filter(r => (cap===0 || !r.capacity || r.capacity>=cap) && (!equip || r.equip.includes(equip)));
+  }
+  function dayBookings(){
+    const q = ($("searchInput").value||"").trim();
+    return bookings.filter(b => b.date===selectedDate && (!q || (b.title+b.name).includes(q)))
+      .sort((a,b)=> toMin(a.start)-toMin(b.start));
+  }
+  function roomName(id){ return (ROOMS.find(r=>r.id===id)||{}).name || id; }
+
+  // ===== 渲染 =====
+  function renderStats(){
+    const day = dayBookings();
+    const now = new Date(), nowMin = now.getHours()*60+now.getMinutes(), todayStr = fmtDate(now);
+    let freeNow = 0;
+    ROOMS.forEach(r=>{
+      const busy = selectedDate===todayStr && bookings.some(b=>b.roomId===r.id && b.date===todayStr && toMin(b.start)<=nowMin && nowMin<toMin(b.end));
+      if(!busy) freeNow++;
+    });
+    const roomsWithFree = filteredRooms().filter(r => day.filter(b=>b.roomId===r.id).length < 12).length;
+    $("statRooms").textContent = ROOMS.length;
+    $("statToday").textContent = day.length;
+    $("statFreeNow").textContent = selectedDate===todayStr ? freeNow : "—";
+    $("statFreeToday").textContent = roomsWithFree;
+  }
+  function renderRooms(){
+    const rooms = filteredRooms(), day = dayBookings();
+    $("roomsGrid").innerHTML = rooms.length ? rooms.map(r=>{
+      const list = day.filter(b=>b.roomId===r.id);
+      const now = new Date(), nowMin = now.getHours()*60+now.getMinutes(), isToday = selectedDate===fmtDate(now);
+      const busyNow = isToday && list.some(b=> toMin(b.start)<=nowMin && nowMin<toMin(b.end));
+      return `<article class="card room">
+        <h3>${esc(r.name)}</h3>
+        <div class="meta">${esc(r.floor)} ・ ${r.capacity ? `最多 ${r.capacity} 人` : "容納人數待確認"}</div>
+        ${r.equip.length ? `<div class="tags">${r.equip.map(e=>`<span class="tag">${esc(e)}</span>`).join("")}</div>` : ""}
+        <div class="avail ${busyNow?"busy":"free"}">${busyNow?"● 現在使用中":"○ 現在空閒"}</div>
+        <div class="day-bookings">
+          ${list.length ? list.map(b=>`<div class="booking-chip"><div><b>${esc(b.start)}–${esc(b.end)} ${esc(b.title)}</b><small>${esc(b.name)}</small></div><button class="btn btn-danger btn-small" type="button" data-cancel="${b.id}">取消</button></div>`).join("")
+          : `<div class="empty">這天目前沒有預約</div>`}
+        </div>
+        <div class="room-foot" style="margin-top:12px">
+          <button class="btn btn-primary btn-small" type="button" data-book="${r.id}">預約此會議室</button>
+        </div>
+      </article>`;
+    }).join("") : `<div class="card empty">沒有符合條件的會議室，請放寬人數或設備條件。</div>`;
+  }
+  function renderTable(){
+    const rooms = filteredRooms();
+    $("scheduleTitle").textContent = `全日時間表 ・ ${weekdayLabel(selectedDate)}`;
+    $("tableHead").innerHTML = `<th>時間</th>` + rooms.map(r=>`<th>${esc(r.name)}<br><small style="color:var(--muted);font-weight:400">${r.capacity ? r.capacity+"人" : "人數待確認"}</small></th>`).join("");
+    const day = dayBookings();
+    let rows = "";
+    for(let t=OPEN_MIN; t<CLOSE_MIN; t+=60){
+      const label = `${toTime(t)}–${toTime(t+60)}`;
+      rows += `<tr><td class="time">${label}</td>` + rooms.map(r=>{
+        const b = day.find(x=>x.roomId===r.id && toMin(x.start)<=t && t<toMin(x.end));
+        if(b) return `<td class="slot booked"><b>${esc(b.title)}</b><small>${esc(b.start)}–${esc(b.end)} ・ ${esc(b.name)}</small></td>`;
+        return `<td class="slot" data-slot-room="${r.id}" data-slot-start="${toTime(t)}" data-slot-end="${toTime(t+60)}">空閒</td>`;
+      }).join("") + `</tr>`;
+    }
+    $("tableBody").innerHTML = rows || `<tr><td colspan="99" class="empty">沒有符合條件的會議室</td></tr>`;
+  }
+  function renderList(){
+    const my = ($("myNameInput").value||"").trim();
+    let list = dayBookings();
+    if(my) list = list.filter(b=>b.name.includes(my));
+    $("listBody").innerHTML = list.length ? list.map(b=>`<div class="list-item">
+      <div><b>${esc(b.start)}–${esc(b.end)} ・ ${esc(roomName(b.roomId))}</b><div>${esc(b.title)}</div>
+      <small style="color:var(--muted)">${esc(b.name)}${b.note?" ・ "+esc(b.note):""}</small></div>
+      <button class="btn btn-danger btn-small" type="button" data-cancel="${b.id}">取消預約</button>
+    </div>`).join("") : `<div class="empty">這天目前沒有${my?"符合姓名的":""}預約。</div>`;
+  }
+  function renderAll(){
+    $("dateLabel").textContent = weekdayLabel(selectedDate);
+    $("dateInput").value = selectedDate;
+    renderStats(); renderRooms(); renderTable(); renderList();
+  }
+
+  // ===== 預約表單 =====
+  function timeOptions(){
+    let html = "";
+    for(let t=OPEN_MIN; t<=CLOSE_MIN; t+=30) html += `<option value="${toTime(t)}">${toTime(t)}</option>`;
+    return html;
+  }
+  function openModal(roomId, start, end){
+    $("fRoom").innerHTML = ROOMS.map(r=>`<option value="${r.id}">${esc(r.name)}${r.capacity ? `（${r.capacity}人）` : ""}</option>`).join("");
+    $("fStart").innerHTML = timeOptions(); $("fEnd").innerHTML = timeOptions();
+    $("fRoom").value = roomId || ROOMS[0].id;
+    $("fDate").value = selectedDate;
+    $("fStart").value = start || "09:00"; $("fEnd").value = end || "10:00";
+    $("formError").classList.remove("show"); $("formError").textContent = "";
+    $("overlay").classList.add("open");
+    setTimeout(()=>$("fTitle").focus(), 50);
+  }
+  function closeModal(){ $("overlay").classList.remove("open"); }
+  function showError(msg){ const el=$("formError"); el.textContent=msg; el.classList.add("show"); }
+  function showGlobal(msg){ const el=$("globalMsg"); el.textContent=msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 4000); }
+  function suggestNext(roomId, date, start){
+    const day = bookings.filter(b=>b.roomId===roomId && b.date===date).sort((a,b)=>toMin(a.start)-toMin(b.start));
+    for(let t=toMin(start); t+60<=CLOSE_MIN; t+=30){
+      const s=toTime(t), e=toTime(t+60);
+      if(!day.some(b=>overlaps(s,e,b.start,b.end))) return `${s}–${e}`;
+    }
+    return null;
+  }
+
+  // ===== 事件 =====
+  $("prevDay").onclick = ()=>{ selectedDate = addDays(selectedDate,-1); renderAll(); };
+  $("nextDay").onclick = ()=>{ selectedDate = addDays(selectedDate,1); renderAll(); };
+  $("todayBtn").onclick = ()=>{ selectedDate = fmtDate(new Date()); renderAll(); };
+  $("dateInput").onchange = e => { if(e.target.value){ selectedDate = e.target.value; renderAll(); } };
+  $("capacityFilter").onchange = renderAll; if($("equipFilter")) $("equipFilter").onchange = renderAll;
+  $("searchInput").oninput = renderAll; $("myNameInput").oninput = renderList;
+  $("viewTableBtn").onclick = ()=>{ viewMode="table"; $("viewTableBtn").classList.add("active"); $("viewListBtn").classList.remove("active"); $("tableView").style.display=""; $("listView").style.display="none"; };
+  $("viewListBtn").onclick = ()=>{ viewMode="list"; $("viewListBtn").classList.add("active"); $("viewTableBtn").classList.remove("active"); $("tableView").style.display="none"; $("listView").style.display=""; renderList(); };
+  $("newBookingBtn").onclick = ()=>openModal();
+  $("closeModal").onclick = closeModal; $("cancelForm").onclick = closeModal;
+  $("overlay").addEventListener("click", e=>{ if(e.target===$("overlay")) closeModal(); });
+  document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeModal(); });
+  $("clearDemoBtn").onclick = ()=>{
+    if(!confirm("確定要清除所有示範資料嗎？之後的新預約不會受影響。")) return;
+    bookings = bookings.filter(b=>!b.id.startsWith("demo")); saveAll(); renderAll(); showGlobal("示範資料已清除。");
+  };
+
+  document.addEventListener("click", e=>{
+    const bookBtn = e.target.closest("[data-book]");
+    if(bookBtn){ openModal(bookBtn.dataset.book); return; }
+    const slot = e.target.closest("[data-slot-room]");
+    if(slot){ openModal(slot.dataset.slotRoom, slot.dataset.slotStart, slot.dataset.slotEnd); return; }
+    const cancelBtn = e.target.closest("[data-cancel]");
+    if(cancelBtn){
+      const b = bookings.find(x=>x.id===cancelBtn.dataset.cancel);
+      if(!b) return;
+      if(!confirm(`確定取消「${b.title}」（${b.date} ${b.start}–${b.end}，${roomName(b.roomId)}）嗎？`)) return;
+      bookings = bookings.filter(x=>x.id!==b.id); saveAll(); renderAll(); showGlobal("預約已取消。");
+    }
+  });
+
+  $("bookingForm").addEventListener("submit", e=>{
+    e.preventDefault();
+    const roomId=$("fRoom").value, date=$("fDate").value, start=$("fStart").value, end=$("fEnd").value;
+    const title=$("fTitle").value.trim(), name=$("fName").value.trim();
+    const note=$("fNote").value.trim();
+    if(!title || !name){ showError("請填寫會議名稱與預約人。"); return; }
+    if(toMin(end) <= toMin(start)){ showError("結束時間必須晚於開始時間。"); return; }
+    const conflict = bookings.find(b=>b.roomId===roomId && b.date===date && overlaps(start,end,b.start,b.end));
+    if(conflict){
+      const next = suggestNext(roomId, date, start);
+      showError(`這個時段已被「${conflict.title}（${conflict.start}–${conflict.end}，${conflict.name}）」預約。${next?`建議改約 ${next}，或換一間會議室。`:"當天已無一小時空檔，請改日期或換一間會議室。"}`);
+      return;
+    }
+    // 寫入前再檢查一次（多人同時送出時的最後防線）
+    bookings.push({ id:"b"+Date.now()+Math.floor(Math.random()*1000), roomId, date, start, end, title, name, note, createdAt:Date.now() });
+    const dup = bookings.filter(b=>b.roomId===roomId && b.date===date && overlaps(start,end,b.start,b.end));
+    if(dup.length > 1){
+      bookings = bookings.filter(b=>!(b.roomId===roomId && b.date===date && overlaps(start,end,b.start,b.end) && b.title===title && b.name===name) || b.id===dup[0].id);
+      // 簡化處理：若仍有衝突，以第一筆為準，提示使用者
+      if(bookings.some(b=>b.id!==dup[0].id && b.roomId===roomId && b.date===date && overlaps(start,end,b.start,b.end))){
+        showError("剛剛已有其他人搶先預約這個時段，請改選其他時段。"); renderAll(); return;
+      }
+    }
+    saveAll(); selectedDate = date; closeModal(); renderAll();
+    showGlobal(`預約成功：${date} ${start}–${end} ・ ${roomName(roomId)} ・ ${title}`);
+  });
+
+  // ===== 啟動 =====
+  window.addEventListener("storage", e=>{ if(e.key===LS_KEY && e.newValue){ try{ bookings=stripRemovedFields(JSON.parse(e.newValue)); renderAll(); }catch(err){} } });
+  loadLocal();
+  if(!initFirebase()){
+    $("syncDot").classList.remove("on"); $("syncText").textContent = "本機模式（多分頁即時同步）";
+  }
+  renderAll();
+</script>
+</body>
+</html>
